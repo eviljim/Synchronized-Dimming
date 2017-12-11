@@ -31,6 +31,9 @@ preferences {
     section("Select devices to dim together:") {
         input "dimmers", "capability.switchLevel", required:true, title:"Dimmers", multiple:true
     }
+    section("Select switches to turn on/off together:") {
+    	input "switches", "capability.switch", required:false, title:"Switches", multiple:true
+    }
 }
 
 def installed() {
@@ -45,14 +48,18 @@ def updated() {
 
 def initialize() {
     unsubscribe()
-    subscribeTo(dimmers ?: [])
-    atomicState.deviceQueue = [:]
-    atomicState.rootDevice = ""
+    subscribeLevelTo(dimmers ?: [])
+    subscribeSwitchesTo(switches ?: [])
+    atomicState.lockTime = 0
+    atomicState.lockDevice = ""
 }
 
-private subscribeTo(devices) {
+private subscribeSwitchesTo(devices) {
     subscribe(devices, "switch.on", tieOn)
     subscribe(devices, "switch.off", tieOff)
+}
+
+private subscribeLevelTo(devices) {
     subscribe(devices, "level", tieLevel)
     subscribe(devices, "switch.setLevel", tieLevel)
 }
@@ -61,46 +68,60 @@ def tieLevel(event) {
     def level = event.value as int
     if (level == 0 && event.value != "0") {
         log.warn "Non-numeric dimmer level coming from ${event.dump()}: ${event.value}"
-    } else {
-        /* To avoid pingponging events forever:
-             1. Wait for levels to settle before propagating events from children.
-             2. No-op if the level to set is identical to the current level.
-         */
-        def deviceQueue = atomicState.deviceQueue
+        return
+    }
 
-        // Because SmartThings prohibits ConcurrentHashMap.
-        synchronized(this) {
-            if (deviceQueue.remove(event.deviceId) == level) {
-                log.trace "${event.displayName} has settled at level ${level}"
-
-                if (!deviceQueue) {
-                    log.trace "Synchronized to ${atomicState.rootDevice}: all dimmers have settled."
-                    atomicState.rootDevice = ""
-                }
-                return
-            } else if (!deviceQueue) {
-                // With an empty queue, this should be the initiating device.
-                atomicState.rootDevice = event.displayName
-                sendNotificationEvent("${event.displayName} set to ${level}, synchronizing ${dimmers.size() - 1} dimmers.")
-            }
-        }
-
-        def remainingDimmers = (dimmers ?: []).findAll { (it != event.device && it.currentValue("level") as int) != level }
-        if (remainingDimmers) {
-            synchronized(this) {
-                deviceQueue << remainingDimmers.collectEntries { ["${it.device.id}": level] }
-            }
-            log.trace "${remainingDimmers.size()} dimmers remain to be updated to level ${level}, immediate trigger: ${event.displayName}, root trigger: ${atomicState.rootDevice}."
-        }
+	if (!checkLock(event)) {
+	    return
+    }
+    sendNotificationEvent("${event.displayName} setLevel to ${level}")
+    
+    def remainingDimmers = (dimmers ?: []).findAll { it != event.device && it.currentValue("level") as int != level }
+    if (remainingDimmers) {
+        log.trace "${remainingDimmers.size()} dimmers remain to be updated to level ${level}, current atomicState: " + atomicState
         remainingDimmers*.setLevel(level)
+    } else {
+        log.trace "No remaining dimmers. atomicState: " + atomicState
+    }
+    
+    if (level > 0) {
+        log.trace "${remainingDimmers.size()} dimmers remain to be turned on"
+    	def remainingSwitches = (switches ?: []).findAll { it != event.device && it.currentValue("switch") != "on" }
+        remainingSwitches*.on()
+    } else {
+        log.trace "${remainingDimmers.size()} dimmers remain to be turned off"
+    	def remainingSwitches = (switches ?: []).findAll { it != event.device && it.currentValue("switch") != "off" }
+        remainingSwitches*.off()
     }
 }
 
+def checkLock(event) {
+	log.trace "Current atomicState: " + atomicState
+    log.trace "Event's device id: " + event.deviceId + "; display name: " + event.displayName
+    if (now() < atomicState.lockTime + 60000 && atomicState.lockDevice != event.deviceId) {
+    	log.trace "Ignoring event due to existing lock."
+        return false
+    }
+    atomicState.lockTime = now()
+    atomicState.lockDevice = event.deviceId
+    log.trace "Setting new atomicState: " + atomicState
+    return true
+}
+
 def tieOn(event) {
-    sendNotificationEvent("${event.displayName} on, turning on ${dimmers.size()} dimmers")
+	if (!checkLock(event)) {
+	    return
+    }
+    sendNotificationEvent("${event.displayName} on, turning on ${dimmers.size()} dimmers and ${switches.size()} switches")
     dimmers?.on()
+    switches?.on()
 }
 
 def tieOff(event) {
+	if (!checkLock(event)) {
+	    return
+    }
+    sendNotificationEvent("${event.displayName} off, turning off ${dimmers.size()} dimmers and ${switches.size()} switches")
     dimmers?.off()
+    switches?.off()
 }
